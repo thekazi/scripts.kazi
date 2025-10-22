@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_PATH="/home/master/applications"
+TIMESTAMP=$(date +%Y%m%d%H%M%S)
+LOG_FILE="/var/log/app_bulk_backup_${TIMESTAMP}.log"
+
+echo "=========================================="
+echo "=== Bulk Backup Started at $(date) ==="
+echo "=========================================="
+echo | tee -a "$LOG_FILE"
+
+for APP_DIR in "${BASE_PATH}"/*; do
+  [[ -d "$APP_DIR" ]] || continue
+  APPNAME=$(basename "$APP_DIR")
+  PUBLIC_HTML="${APP_DIR}/public_html"
+  CONF_DIR="${APP_DIR}/conf"
+  NGINX_CONF="${CONF_DIR}/server.nginx"
+  SQL_FILE="${PUBLIC_HTML}/${APPNAME}_${TIMESTAMP}.sql"
+  ZIP_FILE="${APP_DIR}/backup_${TIMESTAMP}.zip"
+
+  echo
+  echo "=========================================="
+  echo "Processing Application: $APPNAME"
+  echo "=========================================="
+
+  if [[ ! -d "$PUBLIC_HTML" ]]; then
+    echo "⚠️  Skipped: No public_html directory found for $APPNAME"
+    continue
+  fi
+
+  cd "$PUBLIC_HTML"
+
+  # === STEP 1: Dump Database ===
+  echo "Creating MySQL dump for database '$APPNAME'..."
+  if ! mysqldump "$APPNAME" > "$SQL_FILE" 2>/dev/null; then
+    echo "mysqldump failed without credentials. Let's try with user/pass."
+    read -rp "Enter DB user for $APPNAME: " DB_USER
+    read -rsp "Enter DB password for $APPNAME: " DB_PASS
+    echo
+    if ! MYSQL_PWD="$DB_PASS" mysqldump -u "$DB_USER" "$APPNAME" > "$SQL_FILE"; then
+      echo "Error: mysqldump failed. Skipping $APPNAME."
+      continue
+    fi
+  fi
+  echo "Database dump created at: $SQL_FILE"
+
+  # === STEP 2: Adjust permissions ===
+  chown "${APPNAME}":www-data "$SQL_FILE" || true
+  chmod 664 "$SQL_FILE"
+
+  # === STEP 3: Create Zip of public_html ===
+  cd "$APP_DIR"
+  echo "Creating zip archive (this may take a while)..."
+  zip -r "$ZIP_FILE" public_html > /dev/null
+  echo "Backup zip created: $ZIP_FILE"
+
+  # === STEP 4: Remove .sql file after zipping ===
+  rm -f "$SQL_FILE"
+  echo "Removed SQL dump from public_html."
+
+  # === STEP 5: Fix ownerships and permissions for zip ===
+  chown "${APPNAME}":www-data "$ZIP_FILE" || true
+  chmod 664 "$ZIP_FILE"
+
+  # === STEP 6: Move zip into public_html ===
+  mv "$ZIP_FILE" "$PUBLIC_HTML/"
+  FINAL_ZIP="${PUBLIC_HTML}/$(basename "$ZIP_FILE")"
+  echo "Moved zip to: $FINAL_ZIP"
+
+  # === STEP 7: Display domain info (optional) ===
+  if [[ -f "$NGINX_CONF" ]]; then
+    echo
+    echo "Domain info from ${NGINX_CONF}:"
+    grep -E "server_name|listen" "$NGINX_CONF" | sed 's/^[ \t]*//'
+    echo
+  fi
+
+  echo "---- Backup completed successfully for $APPNAME ----"
+  echo "File: $FINAL_ZIP"
+  echo
+done
+
+echo "=========================================="
+echo "=== Bulk Backup Finished at $(date) ==="
+echo "Logs saved at: $LOG_FILE"
+echo "=========================================="
