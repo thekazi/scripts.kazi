@@ -1,4 +1,4 @@
-"#!/bin/bash
+#!/bin/bash
 
 # Directory containing application folders
 app_base_dir=""/home/master/applications""
@@ -18,4 +18,4 @@ ls -d ""$app_base_dir""/* | while read app_dir; do
     fi
 
     echo ""---------------------------""
-done"
+done
