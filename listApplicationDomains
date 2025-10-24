@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Base directory containing all applications
+APP_BASE_DIR="/home/master/applications"
+
+echo
+echo "=== Application Domain Summary ==="
+echo
+
+# Loop through all real directories (skip symlinks)
+for app_dir in "$APP_BASE_DIR"/*; do
+    # Skip if not a directory or is a symlink
+    [[ -d "$app_dir" && ! -L "$app_dir" ]] || continue
+
+    app_name=$(basename "$app_dir")
+    nginx_conf="${app_dir}/conf/server.nginx"
+
+    echo "Application: ${app_name}"
+
+    if [[ -f "$nginx_conf" ]]; then
+        # Extract domains from server_name lines
+        grep -E "server_name" "$nginx_conf" \
+        | awk '{for (i=2; i<=NF; i++) print $i}' \
+        | sed 's/;$//' || true
+    else
+        echo "server.nginx file not found"
+    fi
+
+    echo "---------------------------"
+done
