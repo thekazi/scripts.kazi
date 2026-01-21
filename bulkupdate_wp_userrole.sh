@@ -3,7 +3,7 @@
 # WordPress Bulk User Role Change Script
 # Scans all WordPress apps and changes user role where the user exists
 
-EMAIL="mickael@ingenius.agency"
+EMAIL=""
 NEW_ROLE="subscriber"
 WORDPRESS_PATH="/home/master/applications/*/public_html"
 
