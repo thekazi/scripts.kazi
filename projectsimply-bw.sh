@@ -1,16 +1,71 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Cloudways Access Log Analyzer
-# Date range: 25/Feb/2026 – 17/Mar/2026
 # Outputs: Bandwidth by type | Top 20 largest files | Top 20 most requested URLs
 # =============================================================================
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-LOG_DIR="${1:-.}"                          # Pass log directory as arg, default = current dir
+APPS_ROOT="/home/master/applications"
 LOG_PATTERN="backend_wordpress-*.access.log"
-START_DATE="25/Feb/2026"
-END_DATE="17/Mar/2026"
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── APP DISCOVERY & SELECTION ────────────────────────────────────────────────
+declare -a APP_NAMES
+declare -a APP_LOG_DIRS
+
+for dir in "$APPS_ROOT"/*/logs; do
+  [ -d "$dir" ] || continue
+  app=$(basename "$(dirname "$dir")")
+  APP_NAMES+=("$app")
+  APP_LOG_DIRS+=("$dir")
+done
+
+if [ "${#APP_NAMES[@]}" -eq 0 ]; then
+  echo "No app log directories found under $APPS_ROOT/*/logs"
+  exit 1
+fi
+
+echo "============================================================"
+echo " Available Applications"
+echo "============================================================"
+for i in "${!APP_NAMES[@]}"; do
+  printf "%3d) %s\n" "$((i+1))" "${APP_NAMES[$i]}"
+done
+echo ""
+
+read -rp "Select app number to analyze: " SEL
+
+if ! [[ "$SEL" =~ ^[0-9]+$ ]] || [ "$SEL" -lt 1 ] || [ "$SEL" -gt "${#APP_NAMES[@]}" ]; then
+  echo "Invalid selection."
+  exit 1
+fi
+
+IDX=$((SEL-1))
+LOG_DIR="${APP_LOG_DIRS[$IDX]}"
+APP_NAME="${APP_NAMES[$IDX]}"
+
+# ── DATE RANGE VALIDATION ─────────────────────────────────────────────────────
+validate_date() {
+  # Expects DD/Mon/YYYY, e.g. 25/Feb/2026
+  [[ "$1" =~ ^[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}$ ]]
+}
+
+while true; do
+  read -rp "Enter START date (DD/Mon/YYYY, e.g. 25/Feb/2026): " START_DATE
+  validate_date "$START_DATE" && break
+  echo "Invalid format. Use DD/Mon/YYYY, e.g. 01/Jan/2026"
+done
+
+while true; do
+  read -rp "Enter END date   (DD/Mon/YYYY, e.g. 17/Mar/2026): " END_DATE
+  validate_date "$END_DATE" && break
+  echo "Invalid format. Use DD/Mon/YYYY, e.g. 31/Jan/2026"
+done
+
+echo ""
+echo "Selected app: $APP_NAME"
+echo "Log dir     : $LOG_DIR"
+echo ""
 
 # Convert DD/Mon/YYYY to a comparable integer YYYYMMDD
 date_to_int() {
@@ -35,32 +90,33 @@ date_to_int() {
 START_INT=$(date_to_int "$START_DATE")
 END_INT=$(date_to_int "$END_DATE")
 
+if [ "$START_INT" -gt "$END_INT" ]; then
+  echo "Error: START date is after END date."
+  exit 1
+fi
+
 echo "============================================================"
 echo " Cloudways Access Log Report"
+echo " App    : $APP_NAME"
 echo " Period : $START_DATE  →  $END_DATE"
 echo " Log dir: $LOG_DIR"
 echo "============================================================"
 echo ""
 
 # ── COLLECT & FILTER LOGS ────────────────────────────────────────────────────
-# Streams all matching log lines (plain + gzipped) through awk date filter
-
 get_filtered_lines() {
   {
-    # Plain log files
     for f in "$LOG_DIR"/$LOG_PATTERN; do
       [ -f "$f" ] && cat "$f"
     done
-    # Compressed log files
     for f in "$LOG_DIR"/${LOG_PATTERN}.*.gz; do
       [ -f "$f" ] && zcat "$f"
     done
   } | awk -v start="$START_INT" -v end="$END_INT" '
     {
-      # Extract date field: [25/Feb/2026:...
       match($0, /\[([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4})/, arr)
       if (RSTART == 0) next
-      raw = arr[1]   # e.g. 25/Feb/2026
+      raw = arr[1]
 
       split(raw, p, "/")
       day = p[1]; mon_str = p[2]; year = p[3]
@@ -112,14 +168,12 @@ echo "============================================================"
 echo " BANDWIDTH BY CONTENT TYPE"
 echo "============================================================"
 
-# $7 = request URI  $10 = bytes sent  (standard combined log format)
 echo "$FILTERED" | awk '
 {
   uri = $7
   bytes = $10
   if (bytes == "-") bytes = 0
 
-  # Classify
   if (uri ~ /\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|tiff|mp4|webm|mov|avi|mkv|ogg|ogv)(\?|$)/i)
     img += bytes
   else if (uri ~ /\.(js|css|woff|woff2|ttf|eot|map)(\?|$)/i)
@@ -157,7 +211,6 @@ echo "$FILTERED" | awk '
   uri = $7
   bytes = $10
   if (bytes == "-" || bytes+0 == 0) next
-  # Strip query string for grouping
   split(uri, parts, "?")
   clean = parts[1]
   vol[clean] += bytes
