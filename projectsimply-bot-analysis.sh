@@ -1,19 +1,105 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Cloudways Access Log — Bot & Suspicious Traffic Analyzer
-# Analyzes two date windows for bot activity, suspicious UAs, attack paths
-# Usage: ./analyze_bot_traffic.sh [log-directory]
+# Prompts for app database(s) and date window(s), then reports on bot
+# activity, suspicious UAs, and attack paths for each.
+# Usage: ./analyze_bot_traffic.sh
 # =============================================================================
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-LOG_DIR="${1:-.}"                          # Pass log directory as arg, default = current dir
+BASE_APPS_DIR="/home/master/applications"
 LOG_PATTERN="backend_wordpress-*.access.log"
 
-# Define analysis windows as pairs: START_DATE END_DATE
-WINDOWS=(
-  "16/Mar/2026" "18/Mar/2026"
-  "20/Mar/2026" "22/Mar/2026"
-)
+# ── PROMPT FOR APPLICATION(S) ─────────────────────────────────────────────────
+if [ ! -d "$BASE_APPS_DIR" ]; then
+  echo "ERROR: $BASE_APPS_DIR not found. Run this on the Cloudways server itself."
+  exit 1
+fi
+
+mapfile -t AVAILABLE_APPS < <(cd "$BASE_APPS_DIR" 2>/dev/null && for d in */; do [ -d "$d" ] && echo "${d%/}"; done | sort)
+
+if [ ${#AVAILABLE_APPS[@]} -eq 0 ]; then
+  echo "No applications found under $BASE_APPS_DIR"
+  exit 1
+fi
+
+echo "Available applications under $BASE_APPS_DIR:"
+printf '  %s\n' "${AVAILABLE_APPS[@]}"
+echo ""
+
+SELECTED_APPS=()
+while [ ${#SELECTED_APPS[@]} -eq 0 ]; do
+  read -rp "Enter app database name to check, or ALL: " APP_CHOICE
+
+  if [ -z "$APP_CHOICE" ]; then
+    echo "  Please enter an app name or ALL."
+    continue
+  fi
+
+  if [ "$APP_CHOICE" = "ALL" ] || [ "$APP_CHOICE" = "all" ]; then
+    SELECTED_APPS=("${AVAILABLE_APPS[@]}")
+  else
+    FOUND=0
+    for a in "${AVAILABLE_APPS[@]}"; do
+      [ "$a" = "$APP_CHOICE" ] && FOUND=1
+    done
+    if [ $FOUND -eq 0 ]; then
+      echo "  '$APP_CHOICE' not found. Pick one from the list above, or type ALL."
+      continue
+    fi
+    SELECTED_APPS=("$APP_CHOICE")
+  fi
+done
+echo ""
+
+# ── PROMPT FOR DATE WINDOWS ───────────────────────────────────────────────────
+DATE_RE='^[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}$'
+
+validate_date() {
+  local d="$1"
+  if [[ ! "$d" =~ $DATE_RE ]]; then
+    return 1
+  fi
+  local mon_str
+  mon_str=$(echo "$d" | cut -d'/' -f2)
+  case "$mon_str" in
+    Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+WINDOWS=()
+
+echo "Enter date windows to analyze (format: DD/Mon/YYYY, e.g. 16/Mar/2026)."
+echo "These will be applied to every selected application."
+echo "Press Enter with no input when done."
+echo ""
+
+while true; do
+  read -rp "Start date [blank to finish]: " START_DATE
+  [ -z "$START_DATE" ] && break
+
+  if ! validate_date "$START_DATE"; then
+    echo "  Invalid format. Use DD/Mon/YYYY (e.g. 16/Mar/2026)."
+    continue
+  fi
+
+  read -rp "End date: " END_DATE
+
+  if ! validate_date "$END_DATE"; then
+    echo "  Invalid format. Use DD/Mon/YYYY (e.g. 18/Mar/2026)."
+    continue
+  fi
+
+  WINDOWS+=("$START_DATE" "$END_DATE")
+  echo "  Added window: $START_DATE -> $END_DATE"
+  echo ""
+done
+
+if [ ${#WINDOWS[@]} -eq 0 ]; then
+  echo "No date windows entered. Exiting."
+  exit 1
+fi
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Convert DD/Mon/YYYY to a comparable integer YYYYMMDD
@@ -38,16 +124,17 @@ date_to_int() {
 
 # ── COLLECT & FILTER LOGS for a given date range ─────────────────────────────
 get_filtered_lines() {
-  local start_int="$1"
-  local end_int="$2"
+  local log_dir="$1"
+  local start_int="$2"
+  local end_int="$3"
 
   {
     # Plain log files
-    for f in "$LOG_DIR"/$LOG_PATTERN; do
+    for f in "$log_dir"/$LOG_PATTERN; do
       [ -f "$f" ] && cat "$f"
     done
     # Compressed log files
-    for f in "$LOG_DIR"/${LOG_PATTERN}.*.gz; do
+    for f in "$log_dir"/${LOG_PATTERN}.*.gz; do
       [ -f "$f" ] && zcat "$f"
     done
   } | awk -v start="$start_int" -v end="$end_int" '
@@ -103,277 +190,288 @@ phpinfo|/bin/sh|/bin/bash|insert.{0,10}into|drop.{0,10}table|\
 %3[Cc]script|javascript:|<script|alert\("
 
 # =============================================================================
-# MAIN — iterate over each window pair
+# MAIN — iterate over each selected application, then each window pair
 # =============================================================================
 
-echo "============================================================"
-echo " Cloudways Bot & Suspicious Traffic Report"
-echo " Log dir: $LOG_DIR"
-echo "============================================================"
-echo ""
+for APP_NAME in "${SELECTED_APPS[@]}"; do
+  LOG_DIR="$BASE_APPS_DIR/$APP_NAME/logs"
 
-# Accumulate suspicious IPs across all windows for final blocklist
-ALL_SUSP_IPS_FILE=$(mktemp)
-trap 'rm -f "$ALL_SUSP_IPS_FILE"' EXIT
-
-i=0
-while [ $i -lt ${#WINDOWS[@]} ]; do
-  START_DATE="${WINDOWS[$i]}"
-  END_DATE="${WINDOWS[$((i+1))]}"
-  i=$((i+2))
-
-  START_INT=$(date_to_int "$START_DATE")
-  END_INT=$(date_to_int "$END_DATE")
-
-  echo "============================================================"
-  echo " WINDOW: $START_DATE  ->  $END_DATE"
-  echo "============================================================"
+  echo "############################################################"
+  echo "# APPLICATION: $APP_NAME"
+  echo "# Log dir: $LOG_DIR"
+  echo "############################################################"
   echo ""
 
-  FILTERED=$(get_filtered_lines "$START_INT" "$END_INT")
-
-  if [ -z "$FILTERED" ]; then
-    echo "WARNING: No log lines found for this window."
+  if [ ! -d "$LOG_DIR" ]; then
+    echo "WARNING: Log directory not found for '$APP_NAME'. Skipping."
     echo ""
     continue
   fi
 
-  TOTAL_LINES=$(echo "$FILTERED" | wc -l)
-  echo "Matched lines: $TOTAL_LINES"
-  echo ""
+  # Accumulate suspicious IPs across all windows for this app's final blocklist
+  ALL_SUSP_IPS_FILE=$(mktemp)
 
-  # ── 1. KNOWN / LEGITIMATE BOTS ─────────────────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 1. KNOWN / LEGITIMATE BOTS"
-  echo "------------------------------------------------------------"
+  i=0
+  while [ $i -lt ${#WINDOWS[@]} ]; do
+    START_DATE="${WINDOWS[$i]}"
+    END_DATE="${WINDOWS[$((i+1))]}"
+    i=$((i+2))
 
-  KNOWN_LINES=$(echo "$FILTERED" | grep -iE "$KNOWN_BOT_PATTERN" || true)
-  KNOWN_COUNT=$(echo "$KNOWN_LINES" | grep -c . || true)
+    START_INT=$(date_to_int "$START_DATE")
+    END_INT=$(date_to_int "$END_DATE")
 
-  echo "Total requests from known bots: $KNOWN_COUNT"
-  echo ""
+    echo "============================================================"
+    echo " WINDOW: $START_DATE  ->  $END_DATE"
+    echo "============================================================"
+    echo ""
 
-  if [ "$KNOWN_COUNT" -gt 0 ]; then
-    echo "Top known bots (by request count):"
-    echo "$KNOWN_LINES" | awk '
+    FILTERED=$(get_filtered_lines "$LOG_DIR" "$START_INT" "$END_INT")
+
+    if [ -z "$FILTERED" ]; then
+      echo "WARNING: No log lines found for this window."
+      echo ""
+      continue
+    fi
+
+    TOTAL_LINES=$(echo "$FILTERED" | wc -l)
+    echo "Matched lines: $TOTAL_LINES"
+    echo ""
+
+    # ── 1. KNOWN / LEGITIMATE BOTS ───────────────────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 1. KNOWN / LEGITIMATE BOTS"
+    echo "------------------------------------------------------------"
+
+    KNOWN_LINES=$(echo "$FILTERED" | grep -iE "$KNOWN_BOT_PATTERN" || true)
+    KNOWN_COUNT=$(echo "$KNOWN_LINES" | grep -c . || true)
+
+    echo "Total requests from known bots: $KNOWN_COUNT"
+    echo ""
+
+    if [ "$KNOWN_COUNT" -gt 0 ]; then
+      echo "Top known bots (by request count):"
+      echo "$KNOWN_LINES" | awk '
+      {
+        n = split($0, f, "\"")
+        ua = (n >= 6) ? f[6] : "-"
+        split(ua, t, " ")
+        bot = t[1]
+        count[bot]++
+      }
+      END {
+        for (b in count) print count[b], b
+      }' | sort -rn | head -15 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "Bot" }
+             { printf "%-8s  %s\n", $1, $2 }'
+      echo ""
+
+      echo "Top known-bot source IPs:"
+      echo "$KNOWN_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
+             { printf "%-8s  %s\n", $1, $2 }'
+      echo ""
+    fi
+
+    # ── 2. SUSPICIOUS / MALICIOUS BOTS ───────────────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 2. SUSPICIOUS / MALICIOUS BOTS & TOOLS"
+    echo "------------------------------------------------------------"
+
+    SUSP_LINES=$(echo "$FILTERED" | grep -iE "$SUSPICIOUS_PATTERN" || true)
+    SUSP_COUNT=$(echo "$SUSP_LINES" | grep -c . || true)
+
+    echo "Total suspicious UA requests: $SUSP_COUNT"
+    echo ""
+
+    if [ "$SUSP_COUNT" -gt 0 ]; then
+      echo "Suspicious user-agents detected:"
+      echo "$SUSP_LINES" | awk '
+      {
+        n = split($0, f, "\"")
+        ua = (n >= 6) ? f[6] : "-"
+        count[ua]++
+      }
+      END {
+        for (u in count) print count[u], u
+      }' | sort -rn | head -15 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "User-Agent" }
+             { printf "%-8s  %s\n", $1, substr($0, index($0,$2)) }'
+      echo ""
+
+      echo "Top offending IPs:"
+      echo "$SUSP_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
+             { printf "%-8s  %s\n", $1, $2 }'
+      echo ""
+
+      echo "$SUSP_LINES" | awk '{print $1}' >> "$ALL_SUSP_IPS_FILE"
+    fi
+
+    # ── 3. EMPTY / BLANK USER-AGENTS ─────────────────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 3. EMPTY / BLANK USER-AGENTS  (highly suspicious)"
+    echo "------------------------------------------------------------"
+
+    EMPTY_LINES=$(echo "$FILTERED" | awk '
     {
       n = split($0, f, "\"")
-      ua = (n >= 6) ? f[6] : "-"
-      split(ua, t, " ")
-      bot = t[1]
-      count[bot]++
-    }
-    END {
-      for (b in count) print count[b], b
-    }' | sort -rn | head -15 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "Bot" }
-           { printf "%-8s  %s\n", $1, $2 }'
+      ua = (n >= 6) ? f[6] : ""
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ua)
+      if (ua == "-" || ua == "" || ua == " ") print
+    }' || true)
+    EMPTY_COUNT=$(echo "$EMPTY_LINES" | grep -c . || true)
+
+    echo "Requests with blank/empty User-Agent: $EMPTY_COUNT"
     echo ""
 
-    echo "Top known-bot source IPs:"
-    echo "$KNOWN_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
-           { printf "%-8s  %s\n", $1, $2 }'
-    echo ""
-  fi
+    if [ "$EMPTY_COUNT" -gt 0 ]; then
+      echo "Top IPs with empty UA:"
+      echo "$EMPTY_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
+             { printf "%-8s  %s\n", $1, $2 }'
+      echo ""
 
-  # ── 2. SUSPICIOUS / MALICIOUS BOTS ─────────────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 2. SUSPICIOUS / MALICIOUS BOTS & TOOLS"
-  echo "------------------------------------------------------------"
+      echo "$EMPTY_LINES" | awk '{print $1}' >> "$ALL_SUSP_IPS_FILE"
+    fi
 
-  SUSP_LINES=$(echo "$FILTERED" | grep -iE "$SUSPICIOUS_PATTERN" || true)
-  SUSP_COUNT=$(echo "$SUSP_LINES" | grep -c . || true)
+    # ── 4. WORDPRESS / SERVER ATTACK PATHS ───────────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 4. WORDPRESS / SERVER ATTACK PATHS"
+    echo "------------------------------------------------------------"
 
-  echo "Total suspicious UA requests: $SUSP_COUNT"
-  echo ""
+    WP_LINES=$(echo "$FILTERED" | grep -iE "$ATTACK_PATH_PATTERN" || true)
+    WP_COUNT=$(echo "$WP_LINES" | grep -c . || true)
 
-  if [ "$SUSP_COUNT" -gt 0 ]; then
-    echo "Suspicious user-agents detected:"
-    echo "$SUSP_LINES" | awk '
-    {
-      n = split($0, f, "\"")
-      ua = (n >= 6) ? f[6] : "-"
-      count[ua]++
-    }
-    END {
-      for (u in count) print count[u], u
-    }' | sort -rn | head -15 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "User-Agent" }
-           { printf "%-8s  %s\n", $1, substr($0, index($0,$2)) }'
+    echo "Requests hitting sensitive/attack paths: $WP_COUNT"
     echo ""
 
-    echo "Top offending IPs:"
-    echo "$SUSP_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
-           { printf "%-8s  %s\n", $1, $2 }'
+    if [ "$WP_COUNT" -gt 0 ]; then
+      echo "Most targeted paths:"
+      echo "$WP_LINES" | awk '
+      {
+        uri = $7
+        split(uri, p, "?")
+        clean = p[1]
+        count[clean]++
+      }
+      END { for (u in count) print count[u], u }
+      ' | sort -rn | head -15 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "Path" }
+             { printf "%-8s  %s\n", $1, $2 }'
+      echo ""
+
+      echo "Top attacking IPs:"
+      echo "$WP_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
+             { printf "%-8s  %s\n", $1, $2 }'
+      echo ""
+
+      echo "HTTP status codes for attack path requests:"
+      echo "$WP_LINES" | awk '{print $9}' | grep -E '^[0-9]{3}$' | \
+        sort | uniq -c | sort -rn | \
+        awk 'NR==1 { printf "%-8s  %s\n", "Count", "HTTP Status" }
+             { printf "%-8s  HTTP %s\n", $1, $2 }'
+      echo ""
+
+      echo "$WP_LINES" | awk '{print $1}' >> "$ALL_SUSP_IPS_FILE"
+    fi
+
+    # ── 5. HIGH-FREQUENCY IPs  (>100 requests) ───────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 5. HIGH-FREQUENCY IPs  (> 100 requests in window)"
+    echo "------------------------------------------------------------"
+
+    HF_RESULT=$(echo "$FILTERED" | awk '{print $1}' | sort | uniq -c | sort -rn | \
+      awk '$1 > 100 { printf "%-8s  %s\n", $1, $2 }' || true)
+    HF_COUNT=$(echo "$HF_RESULT" | grep -c . || true)
+
+    echo "IPs exceeding 100 requests: $HF_COUNT"
     echo ""
+    if [ "$HF_COUNT" -gt 0 ]; then
+      printf "%-8s  %s\n" "Requests" "IP"
+      echo "$HF_RESULT"
+      echo ""
+    fi
 
-    echo "$SUSP_LINES" | awk '{print $1}' >> "$ALL_SUSP_IPS_FILE"
-  fi
+    # ── 6. HTTP STATUS CODE BREAKDOWN ────────────────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 6. HTTP STATUS CODE BREAKDOWN"
+    echo "------------------------------------------------------------"
 
-  # ── 3. EMPTY / BLANK USER-AGENTS ───────────────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 3. EMPTY / BLANK USER-AGENTS  (highly suspicious)"
-  echo "------------------------------------------------------------"
-
-  EMPTY_LINES=$(echo "$FILTERED" | awk '
-  {
-    n = split($0, f, "\"")
-    ua = (n >= 6) ? f[6] : ""
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", ua)
-    if (ua == "-" || ua == "" || ua == " ") print
-  }' || true)
-  EMPTY_COUNT=$(echo "$EMPTY_LINES" | grep -c . || true)
-
-  echo "Requests with blank/empty User-Agent: $EMPTY_COUNT"
-  echo ""
-
-  if [ "$EMPTY_COUNT" -gt 0 ]; then
-    echo "Top IPs with empty UA:"
-    echo "$EMPTY_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
-           { printf "%-8s  %s\n", $1, $2 }'
-    echo ""
-
-    echo "$EMPTY_LINES" | awk '{print $1}' >> "$ALL_SUSP_IPS_FILE"
-  fi
-
-  # ── 4. WORDPRESS / SERVER ATTACK PATHS ─────────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 4. WORDPRESS / SERVER ATTACK PATHS"
-  echo "------------------------------------------------------------"
-
-  WP_LINES=$(echo "$FILTERED" | grep -iE "$ATTACK_PATH_PATTERN" || true)
-  WP_COUNT=$(echo "$WP_LINES" | grep -c . || true)
-
-  echo "Requests hitting sensitive/attack paths: $WP_COUNT"
-  echo ""
-
-  if [ "$WP_COUNT" -gt 0 ]; then
-    echo "Most targeted paths:"
-    echo "$WP_LINES" | awk '
-    {
-      uri = $7
-      split(uri, p, "?")
-      clean = p[1]
-      count[clean]++
-    }
-    END { for (u in count) print count[u], u }
-    ' | sort -rn | head -15 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "Path" }
-           { printf "%-8s  %s\n", $1, $2 }'
-    echo ""
-
-    echo "Top attacking IPs:"
-    echo "$WP_LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
-      awk 'NR==1 { printf "%-8s  %s\n", "Requests", "IP" }
-           { printf "%-8s  %s\n", $1, $2 }'
-    echo ""
-
-    echo "HTTP status codes for attack path requests:"
-    echo "$WP_LINES" | awk '{print $9}' | grep -E '^[0-9]{3}$' | \
-      sort | uniq -c | sort -rn | \
+    echo "$FILTERED" | awk '{print $9}' | grep -E '^[0-9]{3}$' | \
+      sort | uniq -c | sort -rn | head -15 | \
       awk 'NR==1 { printf "%-8s  %s\n", "Count", "HTTP Status" }
            { printf "%-8s  HTTP %s\n", $1, $2 }'
     echo ""
 
-    echo "$WP_LINES" | awk '{print $1}' >> "$ALL_SUSP_IPS_FILE"
-  fi
+    # ── 7. HOURLY REQUEST DISTRIBUTION ───────────────────────────────────────
+    echo "------------------------------------------------------------"
+    echo " 7. HOURLY REQUEST DISTRIBUTION"
+    echo "------------------------------------------------------------"
 
-  # ── 5. HIGH-FREQUENCY IPs  (>100 requests) ─────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 5. HIGH-FREQUENCY IPs  (> 100 requests in window)"
-  echo "------------------------------------------------------------"
-
-  HF_RESULT=$(echo "$FILTERED" | awk '{print $1}' | sort | uniq -c | sort -rn | \
-    awk '$1 > 100 { printf "%-8s  %s\n", $1, $2 }' || true)
-  HF_COUNT=$(echo "$HF_RESULT" | grep -c . || true)
-
-  echo "IPs exceeding 100 requests: $HF_COUNT"
-  echo ""
-  if [ "$HF_COUNT" -gt 0 ]; then
-    printf "%-8s  %s\n" "Requests" "IP"
-    echo "$HF_RESULT"
+    printf "%-8s  %s\n" "Hour" "Requests"
+    echo "$FILTERED" | awk '
+    {
+      match($0, /\[([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4}):([0-9]{2})/, arr)
+      if (RSTART > 0) count[arr[2]]++
+    }
+    END {
+      for (h in count) print h, count[h]
+    }' | sort | awk '{ printf "%-8s  %s\n", $1":00", $2 }'
     echo ""
-  fi
 
-  # ── 6. HTTP STATUS CODE BREAKDOWN ──────────────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 6. HTTP STATUS CODE BREAKDOWN"
-  echo "------------------------------------------------------------"
+    # ── 8. WINDOW SUMMARY ────────────────────────────────────────────────────
+    echo "============================================================"
+    echo " SUMMARY: $START_DATE -> $END_DATE"
+    echo "============================================================"
 
-  echo "$FILTERED" | awk '{print $9}' | grep -E '^[0-9]{3}$' | \
-    sort | uniq -c | sort -rn | head -15 | \
-    awk 'NR==1 { printf "%-8s  %s\n", "Count", "HTTP Status" }
-         { printf "%-8s  HTTP %s\n", $1, $2 }'
-  echo ""
+    BOT_TOTAL=$((KNOWN_COUNT + SUSP_COUNT + EMPTY_COUNT))
+    PCT=0
+    [ "$TOTAL_LINES" -gt 0 ] && PCT=$(( BOT_TOTAL * 100 / TOTAL_LINES ))
 
-  # ── 7. HOURLY REQUEST DISTRIBUTION ─────────────────────────────────────────
-  echo "------------------------------------------------------------"
-  echo " 7. HOURLY REQUEST DISTRIBUTION"
-  echo "------------------------------------------------------------"
+    printf "%-32s  %s\n" "Total requests"              "$TOTAL_LINES"
+    printf "%-32s  %s\n" "Known bot requests"           "$KNOWN_COUNT"
+    printf "%-32s  %s\n" "Suspicious bot requests"      "$SUSP_COUNT"
+    printf "%-32s  %s\n" "Empty User-Agent requests"    "$EMPTY_COUNT"
+    printf "%-32s  %s\n" "Attack-path hits"             "$WP_COUNT"
+    printf "%-32s  ~%s%%\n" "Est. bot/suspicious traffic" "$PCT"
+    echo ""
 
-  printf "%-8s  %s\n" "Hour" "Requests"
-  echo "$FILTERED" | awk '
-  {
-    match($0, /\[([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4}):([0-9]{2})/, arr)
-    if (RSTART > 0) count[arr[2]]++
-  }
-  END {
-    for (h in count) print h, count[h]
-  }' | sort | awk '{ printf "%-8s  %s\n", $1":00", $2 }'
-  echo ""
+    if [ "$SUSP_COUNT" -gt 0 ] || [ "$EMPTY_COUNT" -gt 50 ] || [ "$WP_COUNT" -gt 20 ]; then
+      echo "WARNING: SUSPICIOUS ACTIVITY DETECTED IN THIS WINDOW"
+    else
+      echo "OK: No significant malicious activity detected"
+    fi
+    echo ""
 
-  # ── 8. WINDOW SUMMARY ──────────────────────────────────────────────────────
+  done
+
+  # ===========================================================================
+  # COMBINED SUSPICIOUS IP BLOCKLIST (all windows, this app)
+  # ===========================================================================
   echo "============================================================"
-  echo " SUMMARY: $START_DATE -> $END_DATE"
+  echo " COMBINED SUSPICIOUS IP BLOCKLIST — $APP_NAME  (all windows)"
   echo "============================================================"
-
-  BOT_TOTAL=$((KNOWN_COUNT + SUSP_COUNT + EMPTY_COUNT))
-  PCT=0
-  [ "$TOTAL_LINES" -gt 0 ] && PCT=$(( BOT_TOTAL * 100 / TOTAL_LINES ))
-
-  printf "%-32s  %s\n" "Total requests"              "$TOTAL_LINES"
-  printf "%-32s  %s\n" "Known bot requests"           "$KNOWN_COUNT"
-  printf "%-32s  %s\n" "Suspicious bot requests"      "$SUSP_COUNT"
-  printf "%-32s  %s\n" "Empty User-Agent requests"    "$EMPTY_COUNT"
-  printf "%-32s  %s\n" "Attack-path hits"             "$WP_COUNT"
-  printf "%-32s  ~%s%%\n" "Est. bot/suspicious traffic" "$PCT"
   echo ""
 
-  if [ "$SUSP_COUNT" -gt 0 ] || [ "$EMPTY_COUNT" -gt 50 ] || [ "$WP_COUNT" -gt 20 ]; then
-    echo "WARNING: SUSPICIOUS ACTIVITY DETECTED IN THIS WINDOW"
+  if [ -s "$ALL_SUSP_IPS_FILE" ]; then
+    printf "%-8s  %s\n" "Hits" "IP"
+    sort "$ALL_SUSP_IPS_FILE" | uniq -c | sort -rn | \
+      awk '{ printf "%-8s  %s\n", $1, $2 }'
+    echo ""
+    echo "To block in Nginx, add to your server block:"
+    echo "  deny <IP>;"
+    echo ""
+    echo "To block in .htaccess:"
+    echo "  Require not ip <IP>"
   else
-    echo "OK: No significant malicious activity detected"
+    echo "No suspicious IPs collected across all windows for $APP_NAME."
   fi
-  echo ""
 
+  rm -f "$ALL_SUSP_IPS_FILE"
+  echo ""
 done
 
-# =============================================================================
-# COMBINED SUSPICIOUS IP BLOCKLIST (all windows)
-# =============================================================================
-echo "============================================================"
-echo " COMBINED SUSPICIOUS IP BLOCKLIST  (all windows)"
-echo "============================================================"
-echo ""
-
-if [ -s "$ALL_SUSP_IPS_FILE" ]; then
-  printf "%-8s  %s\n" "Hits" "IP"
-  sort "$ALL_SUSP_IPS_FILE" | uniq -c | sort -rn | \
-    awk '{ printf "%-8s  %s\n", $1, $2 }'
-  echo ""
-  echo "To block in Nginx, add to your server block:"
-  echo "  deny <IP>;"
-  echo ""
-  echo "To block in .htaccess:"
-  echo "  Require not ip <IP>"
-else
-  echo "No suspicious IPs collected across all windows."
-fi
-
-echo ""
 echo "============================================================"
 echo " Report complete."
 echo "============================================================"
