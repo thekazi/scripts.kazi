@@ -6,8 +6,10 @@
 # application under /home/master/applications/*/public_html.
 #
 # Each reset runs as the application's OWN system user (folder name == user),
-# inside a LOGIN shell (bash -lc) so the Cloudways environment loads and the
-# correct 'wp' binary + PHP version are used. Passwords are NOT recorded.
+# in a login shell, AFTER cd-ing into the docroot. The cd is required because
+# these installs load salts from a separate wp-salt.php via a RELATIVE path,
+# which only resolves when the working directory is the docroot (--path alone
+# is not enough). Passwords are NOT recorded.
 #
 # Run as root (or via sudo): it needs 'sudo -u <appuser>'.
 #
@@ -25,10 +27,10 @@ fi
 
 shopt -s nullglob
 
-# Run a wp command as the app user, in a login shell so PATH/PHP are correct.
+# Run a wp command as the app user, from inside the docroot, in a login shell.
 run_wp() {
-    local app="$1"; shift
-    sudo -u "${app}" -H -- bash -lc "$*"
+    local app="$1" docroot="$2"; shift 2
+    sudo -u "${app}" -H -- bash -lc "cd '${docroot}' && $*"
 }
 
 total=0; ok=0; skipped=0
@@ -51,19 +53,19 @@ for appdir in "${APPS_ROOT}"/*/; do
     fi
 
     # 3) It must be a reachable WordPress install.
-    if ! run_wp "${app}" "wp core is-installed --path='${docroot}'" >/dev/null 2>&1; then
+    if ! run_wp "${app}" "${docroot}" "wp core is-installed" >/dev/null 2>&1; then
         echo "SKIP  ${app}: WordPress not installed / not reachable at ${docroot}" >&2
         skipped=$((skipped + 1)); continue
     fi
 
     # 4) The target WP user must be present in THIS install.
-    if ! run_wp "${app}" "wp user get '${WP_USER}' --field=ID --path='${docroot}'" >/dev/null 2>&1; then
+    if ! run_wp "${app}" "${docroot}" "wp user get '${WP_USER}' --field=ID" >/dev/null 2>&1; then
         echo "SKIP  ${app}: WP user '${WP_USER}' not present" >&2
         skipped=$((skipped + 1)); continue
     fi
 
     # 5) Reset the password (random, not recorded; user not emailed).
-    if run_wp "${app}" "wp user reset-password '${WP_USER}' --skip-email --path='${docroot}'" >/dev/null 2>&1; then
+    if run_wp "${app}" "${docroot}" "wp user reset-password '${WP_USER}' --skip-email" >/dev/null 2>&1; then
         echo "OK    ${app}: password reset"
         ok=$((ok + 1))
     else
