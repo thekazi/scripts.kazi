@@ -17,7 +17,7 @@ set -uo pipefail
 
 # ---- Config -----------------------------------------------------------------
 APPS_ROOT="/home/master/applications"
-WP_USER="support@imperium.social"      # WP account to reset (login or email)
+WP_USER=""      # WP account to reset (login or email)
 # -----------------------------------------------------------------------------
 
 if [[ "${EUID}" -ne 0 ]]; then
